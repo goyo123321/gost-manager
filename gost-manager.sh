@@ -2,6 +2,7 @@
 
 #===========================================
 # GOST 一键管理脚本 (v2 & v3 通用) — 加固版
+# 仓库: https://github.com/goyo123321/gost-manager
 #===========================================
 
 umask 077
@@ -1030,7 +1031,7 @@ view_log() {
 }
 
 update_script() {
-    local url="https://raw.githubusercontent.com/goyo123321a/gost-manager/refs/heads/main/gost-manager.sh"
+    local url="https://raw.githubusercontent.com/goyo123321/gost-manager/refs/heads/main/gost-manager.sh"
     local tmp
     tmp=$(mktemp 2>/dev/null) || { echo -e "${RED}无法创建临时文件${NC}"; flush_input; read -n 1 -p "按任意键返回..."; return 1; }
     echo -e "${YELLOW}下载最新脚本...${NC}"
