@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 
 #===========================================
-# GOST 一键管理脚本 (v2 & v3 通用)
+# GOST 一键管理脚本 (v2 & v3 通用) — 加固版
 #===========================================
+
+umask 077
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -28,7 +30,8 @@ flush_input() {
 }
 
 get_local_ip() {
-    local ip=$(ip -4 addr show 2>/dev/null | grep -o 'inet [0-9.]*' | grep -v '127.0.0.1' | head -1 | cut -d' ' -f2)
+    local ip
+    ip=$(ip -4 addr show 2>/dev/null | grep -o 'inet [0-9.]*' | grep -v '127.0.0.1' | head -1 | cut -d' ' -f2)
     if [ -z "$ip" ]; then
         ip=$(hostname -i 2>/dev/null | awk '{print $1}')
     fi
@@ -36,6 +39,20 @@ get_local_ip() {
         ip="$(hostname)"
     fi
     echo "$ip"
+}
+
+# URL 编码（LC_ALL=C 按字节处理，正确编码 UTF-8 与保留字符）
+urlencode() {
+    local s="$1" out="" i c hex
+    local LC_ALL=C
+    for ((i=0; i<${#s}; i++)); do
+        c="${s:i:1}"
+        case "$c" in
+            [a-zA-Z0-9.~_-]) out+="$c" ;;
+            *) printf -v hex '%%%02X' "'$c"; out+="$hex" ;;
+        esac
+    done
+    printf '%s' "$out"
 }
 
 setup_workspace() {
@@ -78,7 +95,8 @@ detect_os_arch() {
 
 get_installed_gost_version() {
     if [ -f "$GOST_BIN" ] && [ -x "$GOST_BIN" ]; then
-        local ver=$("$GOST_BIN" -V 2>&1 | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+        local ver
+        ver=$("$GOST_BIN" -V 2>&1 | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
         [ -n "$ver" ] && echo "$ver" || echo "未知版本"
     else
         echo "未安装"
@@ -86,17 +104,25 @@ get_installed_gost_version() {
 }
 
 is_v3() {
-    local ver=$(get_installed_gost_version)
+    local ver
+    ver=$(get_installed_gost_version)
     [[ "$ver" =~ ^[3-9]\. ]] && return 0
     [[ "$ver" =~ ^v?[3-9]\. ]] && return 0
     return 1
 }
 
+# 加固版版本比较：先提取主版本数字段，非法则视为 0
 version_ge() {
-    local v1=${1#v}; local v2=${2#v}
-    local IFS=.; local arr1=($v1) arr2=($v2)
+    local v1 v2
+    v1=$(printf '%s' "${1#v}" | grep -oE '^[0-9]+(\.[0-9]+)*' | head -1)
+    v2=$(printf '%s' "${2#v}" | grep -oE '^[0-9]+(\.[0-9]+)*' | head -1)
+    [ -z "$v1" ] && v1=0
+    [ -z "$v2" ] && v2=0
+    local IFS=.
+    local arr1=($v1) arr2=($v2)
     while [ ${#arr1[@]} -lt 3 ]; do arr1+=(0); done
     while [ ${#arr2[@]} -lt 3 ]; do arr2+=(0); done
+    local i
     for i in 0 1 2; do
         [ "${arr1[$i]}" -gt "${arr2[$i]}" ] && return 0
         [ "${arr1[$i]}" -lt "${arr2[$i]}" ] && return 1
@@ -129,7 +155,8 @@ stop_gost() {
 }
 
 check_existing_gost() {
-    local ver=$(get_installed_gost_version)
+    local ver
+    ver=$(get_installed_gost_version)
     if [ "$ver" != "未安装" ]; then
         echo -e "${GREEN}当前版本: ${ver}${NC}"
         if pgrep -f "$GOST_BIN" >/dev/null 2>&1; then
@@ -150,6 +177,40 @@ check_existing_gost() {
     fi
 }
 
+# 尽力 SHA256 校验：无法获取/无匹配条目时警告并跳过，不阻断安装
+try_verify_sha256() {
+    local file="$1" sum_url="$2" asset="$3"
+    [ -z "$sum_url" ] && return 0
+    [ -f "$file" ] && [ -s "$file" ] || return 0
+    if ! command -v sha256sum >/dev/null 2>&1; then
+        echo -e "${YELLOW}      未找到 sha256sum，跳过校验${NC}"
+        return 0
+    fi
+    local tmp_sum
+    tmp_sum=$(mktemp 2>/dev/null) || return 0
+    if ! { wget -q --timeout=10 -O "$tmp_sum" "$sum_url" 2>/dev/null \
+        || curl -fsSL --connect-timeout 10 -o "$tmp_sum" "$sum_url" 2>/dev/null; }; then
+        rm -f "$tmp_sum"
+        echo -e "${YELLOW}      无法获取校验和，跳过校验${NC}"
+        return 0
+    fi
+    local expected
+    expected=$(awk -v a="$asset" '$2==a || $2=="*"a {print $1}' "$tmp_sum" 2>/dev/null | head -1)
+    rm -f "$tmp_sum"
+    if [ -z "$expected" ]; then
+        echo -e "${YELLOW}      校验和文件中无匹配条目，跳过校验${NC}"
+        return 0
+    fi
+    local actual
+    actual=$(sha256sum "$file" | awk '{print $1}')
+    if [ "$actual" = "$expected" ]; then
+        echo -e "${GREEN}      SHA256 校验通过${NC}"
+        return 0
+    fi
+    echo -e "${RED}      SHA256 校验失败！${NC}"
+    return 1
+}
+
 install_gost_v2() {
     local version=$1
     check_existing_gost || return 1
@@ -157,12 +218,16 @@ install_gost_v2() {
     rm -f gost gost.tar.gz gost.gz
     local downloaded=0
     if version_ge "$version" "2.12"; then
-        local url="https://github.com/ginuerzh/gost/releases/download/v${version}/gost_${version}_${os}_${cpu_arch}.tar.gz"
+        local asset="gost_${version}_${os}_${cpu_arch}.tar.gz"
+        local url="https://github.com/ginuerzh/gost/releases/download/v${version}/${asset}"
+        local sum_url="https://github.com/ginuerzh/gost/releases/download/v${version}/checksums.txt"
         echo -e "      尝试: ${url}"
         wget -q --timeout=15 -O gost.tar.gz "$url" 2>/dev/null || curl -fsSL --connect-timeout 15 "$url" -o gost.tar.gz 2>/dev/null
         if [ -f gost.tar.gz ] && [ -s gost.tar.gz ]; then
-            tar -xzf gost.tar.gz gost 2>/dev/null || tar -xzf gost.tar.gz 2>/dev/null
-            [ -f gost ] && downloaded=1
+            if try_verify_sha256 "gost.tar.gz" "$sum_url" "$asset"; then
+                tar -xzf gost.tar.gz gost 2>/dev/null || tar -xzf gost.tar.gz 2>/dev/null
+                [ -f gost ] && downloaded=1
+            fi
         fi
     fi
     if [ $downloaded -eq 0 ]; then
@@ -178,6 +243,7 @@ install_gost_v2() {
             armv7) gz_urls+=("https://github.com/ginuerzh/gost/releases/download/v${version}/gost-linux-armv7-${version}.gz") ;;
             386)   gz_urls+=("https://github.com/ginuerzh/gost/releases/download/v${version}/gost-linux-386-${version}.gz") ;;
         esac
+        local url
         for url in "${gz_urls[@]}"; do
             echo -e "      尝试: ${url}"
             if wget -q --timeout=15 -O - "$url" 2>/dev/null | gunzip > gost 2>/dev/null; then
@@ -191,7 +257,11 @@ install_gost_v2() {
         echo -e "${RED}下载失败。${NC}"; flush_input; read -n 1 -p "按任意键退出..."; return 1
     fi
     chmod +x gost
-    [ -f "$GOST_BIN" ] && [ -x "$GOST_BIN" ] && echo -e "${GREEN}✓ 安装成功${NC}" && "$GOST_BIN" -V 2>&1 | head -1 && return 0
+    if [ -f "$GOST_BIN" ] && [ -x "$GOST_BIN" ]; then
+        echo -e "${GREEN}✓ 安装成功${NC}"
+        "$GOST_BIN" -V 2>&1 | head -1
+        return 0
+    fi
     echo -e "${RED}安装失败。${NC}"; flush_input; read -n 1 -p "按任意键退出..."; return 1
 }
 
@@ -201,22 +271,35 @@ install_gost_v3() {
     mkdir -p "$GOST_DIR"; cd "$GOST_DIR" || return 1
     rm -f gost gost.tar.gz
     local clean="${version#v}"
-    local url="https://github.com/go-gost/gost/releases/download/${version}/gost_${clean}_${os}_${cpu_arch}.tar.gz"
+    local asset="gost_${clean}_${os}_${cpu_arch}.tar.gz"
+    local url="https://github.com/go-gost/gost/releases/download/${version}/${asset}"
+    local sum_url="https://github.com/go-gost/gost/releases/download/${version}/gost_${clean}_checksums.txt"
     echo -e "      下载: ${url}"
     wget -q --timeout=15 -O gost.tar.gz "$url" 2>/dev/null || curl -fsSL --connect-timeout 15 "$url" -o gost.tar.gz 2>/dev/null
     if [ -f gost.tar.gz ] && [ -s gost.tar.gz ]; then
-        tar -xzf gost.tar.gz gost 2>/dev/null || tar -xzf gost.tar.gz
-        chmod +x gost; rm -f gost.tar.gz
-        [ -f "$GOST_BIN" ] && [ -x "$GOST_BIN" ] && echo -e "${GREEN}✓ 安装成功${NC}" && return 0
+        if try_verify_sha256 "gost.tar.gz" "$sum_url" "$asset"; then
+            tar -xzf gost.tar.gz gost 2>/dev/null || tar -xzf gost.tar.gz
+            chmod +x gost; rm -f gost.tar.gz
+            if [ -f "$GOST_BIN" ] && [ -x "$GOST_BIN" ]; then
+                echo -e "${GREEN}✓ 安装成功${NC}"
+                return 0
+            fi
+        else
+            rm -f gost.tar.gz
+        fi
     fi
     echo -e "${RED}下载失败。${NC}"; flush_input; read -n 1 -p "按任意键退出..."; return 1
 }
 
 get_v2_versions() {
-    local versions=$(curl -s --connect-timeout 5 "https://api.github.com/repos/ginuerzh/gost/releases" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"v?([^"]+)".*/\1/' | head -10)
+    local versions
+    versions=$(curl -s --connect-timeout 5 "https://api.github.com/repos/ginuerzh/gost/releases" 2>/dev/null \
+        | grep '"tag_name":' | sed -E 's/.*"v?([^"]+)".*/\1/' \
+        | grep -viE 'rc|alpha|beta|nightly|pre' | head -10)
     [ -z "$versions" ] && versions="2.12.0 2.11.5 2.11.4 2.11.3 2.11.2 2.11.1 2.11.0 2.10.0 2.9.2"
     local arr=($versions); local cnt=${#arr[@]}
     echo -e "${GREEN}可用的 v2 版本:${NC}"
+    local i
     for i in "${!arr[@]}"; do echo "  $((i+1))) ${arr[$i]}"; done
     echo "  $((cnt+1))) 返回"
     echo -n -e "${YELLOW}请选择 (默认 1): ${NC}"; read choice; flush_input
@@ -226,12 +309,21 @@ get_v2_versions() {
 }
 
 get_v3_versions() {
-    local all=$(curl -s "https://api.github.com/repos/go-gost/gost/releases" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"(v[^"]+)".*/\1/')
-    local versions=""
-    [ -z "$all" ] && versions="v3.2.6 v3.2.5 v3.2.4 v3.2.3 v3.2.2 v3.2.1 v3.2.0" || versions=$(echo "$all" | grep -viE 'nightly|rc|alpha|beta' | head -10)
+    local all versions
+    all=$(curl -s --connect-timeout 5 "https://api.github.com/repos/go-gost/gost/releases" 2>/dev/null \
+        | grep '"tag_name":' | sed -E 's/.*"(v[^"]+)".*/\1/')
+    if [ -z "$all" ]; then
+        versions="v3.2.6 v3.2.5 v3.2.4 v3.2.3 v3.2.2 v3.2.1 v3.2.0"
+    else
+        versions=$(printf '%s\n' "$all" | grep -viE 'nightly|rc|alpha|beta' | head -10)
+    fi
     local arr=($versions); local cnt=${#arr[@]}
-    [ $cnt -eq 0 ] && arr=(v3.2.6 v3.2.5 v3.2.4 v3.2.3 v3.2.2) && cnt=${#arr[@]}
+    if [ "$cnt" -eq 0 ]; then
+        arr=(v3.2.6 v3.2.5 v3.2.4 v3.2.3 v3.2.2)
+        cnt=${#arr[@]}
+    fi
     echo -e "${GREEN}可用的 v3 稳定版:${NC}"
+    local i
     for i in "${!arr[@]}"; do echo "  $((i+1))) ${arr[$i]}"; done
     echo "  $((cnt+1))) 返回"
     echo -n -e "${YELLOW}请选择 (默认 1): ${NC}"; read choice; flush_input
@@ -257,27 +349,41 @@ select_version_to_install() {
 }
 
 save_node_info() {
-    printf "%s\n" "$1" > "$SUBFILE"
+    printf '%s\n' "$1" > "$SUBFILE"
+    chmod 600 "$SUBFILE" 2>/dev/null
     echo -e "${GREEN}节点信息已保存到: ${SUBFILE}${NC}"
 }
 
-start_gost_generic() {
-    local cmd="$1" info="$2"
+# 统一启动：参数1为展示信息，其余为命令数组
+start_gost() {
+    local info="$1"; shift
+    local cmd=("$@")
+    [ ${#cmd[@]} -eq 0 ] && { echo -e "${RED}内部错误：空命令${NC}"; return 1; }
     cd "$GOST_DIR" || return 1
     stop_gost
     echo -e "${GREEN}启动代理...${NC}"
-    echo "$cmd" > "$GOST_CMD_FILE"
-    echo "=== GOST 启动于 $(date) ===" > "$GOST_LOG"
-    echo "命令: $cmd" >> "$GOST_LOG"
-    echo "信息: $info" >> "$GOST_LOG"
-    nohup $cmd >> "$GOST_LOG" 2>&1 &
+
+    # 序列化命令（%q 转义），权限 600
+    { printf '%q ' "${cmd[@]}"; printf '\n'; } > "$GOST_CMD_FILE"
+    chmod 600 "$GOST_CMD_FILE" 2>/dev/null
+
+    {
+        echo "=== GOST 启动于 $(date) ==="
+        printf '命令: '; printf '%q ' "${cmd[@]}"; echo
+        printf '信息: %s\n' "$info"
+    } > "$GOST_LOG"
+    chmod 600 "$GOST_LOG" 2>/dev/null
+
+    nohup "${cmd[@]}" >> "$GOST_LOG" 2>&1 &
     local pid=$!
-    echo $pid > "$GOST_PID_FILE"
+    echo "$pid" > "$GOST_PID_FILE"
+    chmod 600 "$GOST_PID_FILE" 2>/dev/null
     sleep 2
     if pgrep -f "$GOST_BIN" >/dev/null 2>&1; then
         echo -e "${GREEN}✓ 运行中 (PID: $pid)${NC}"
         echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-        echo -e "${GREEN}代理信息:${NC}\n${YELLOW}${info}${NC}"
+        echo -e "${GREEN}代理信息:${NC}"
+        printf '%s\n' "$info"
         echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
         save_node_info "$info"
         echo "进程 PID: $pid, 启动成功" >> "$GOST_LOG"
@@ -292,6 +398,7 @@ start_gost_generic() {
 
 build_query_string() {
     local q=""; local sep=""
+    local p
     for p in "$@"; do
         [ -n "$p" ] && q="${q}${sep}${p}" && sep="&"
     done
@@ -327,7 +434,6 @@ configure_dns() {
     done
 
     if [ "$dns_mode" = "2" ]; then
-        # 转发模式：本地 dns:// 监听，通过 -F 转发到远程
         echo -e "${YELLOW}远程转发地址格式，例如:${NC}"
         echo -e "  socks5+wss://user:pass@your-vps.com:443?path=/dns"
         echo -e "  relay+wss://your-vps.com:443?path=/dns"
@@ -337,23 +443,21 @@ configure_dns() {
         [ -z "$remote_forward" ] && { echo -e "${RED}远程地址不能为空${NC}"; return 1; }
 
         local listen_addr="${bind_ip}:${port}"
-        local cmd="$GOST_BIN -L dns://${listen_addr} -F $remote_forward"
         local info="DNS 代理 (转发模式): ${listen_addr} -> ${remote_forward}"
-        start_gost_generic "$cmd" "$info"
+        start_gost "$info" "$GOST_BIN" -L "dns://${listen_addr}" -F "$remote_forward"
         echo -e "${YELLOW}启动后请将系统 DNS 设置为 ${bind_ip}:${port}${NC}"
         return
     fi
 
-    # 直接 DoH 模式
     echo -n -e "${YELLOW}上游 DoH 地址 (默认 https://doh.pub/dns-query): ${NC}"
     read doh_url; flush_input
     [ -z "$doh_url" ] && doh_url="https://doh.pub/dns-query"
 
-    local doh_domain=$(echo "$doh_url" | sed -E 's|https?://([^/]+).*|\1|')
+    local doh_domain
+    doh_domain=$(printf '%s' "$doh_url" | sed -E 's|https?://([^/]+).*|\1|')
     echo -e "${YELLOW}重要提示：为避免 DNS 污染，请先在 hosts 文件中添加：${NC}"
     echo -e "${GREEN}120.53.53.53 ${doh_domain}${NC}  (请将 IP 替换为 ${doh_domain} 的真实 IP)"
 
-    local cache_enabled=""
     echo -n -e "${YELLOW}是否启用 DNS 缓存？[y/N]: ${NC}"
     read use_cache; flush_input
     local cache_value=""
@@ -366,14 +470,14 @@ configure_dns() {
     local params=()
     [ -n "$doh_url" ] && params+=("dns=${doh_url}")
     [ -n "$cache_value" ] && params+=("cache=${cache_value}")
-    local query=$(build_query_string "${params[@]}")
+    local query
+    query=$(build_query_string "${params[@]}")
 
     local listen_addr="${bind_ip}:${port}"
-    local cmd="$GOST_BIN -L dns://${listen_addr}${query}"
     local info="DNS 代理 (DoH): ${listen_addr} -> ${doh_url}"
     [ -n "$cache_value" ] && info="${info} (缓存: ${cache_value})"
 
-    start_gost_generic "$cmd" "$info"
+    start_gost "$info" "$GOST_BIN" -L "dns://${listen_addr}${query}"
     echo -e "${YELLOW}启动后请将系统 DNS 设置为 ${bind_ip}:${port}${NC}"
 }
 
@@ -388,15 +492,15 @@ configure_websocket() {
 
     echo -e "${YELLOW}WebSocket 路径 (默认 /ws, 0=无路径): ${NC}"
     echo -n -e "${YELLOW}路径 (必须以 / 开头): ${NC}"; read path_input; flush_input
-    GOST_WS_PATH=""
+    local ws_path=""
     if [ -z "$path_input" ]; then
-        GOST_WS_PATH="/ws"
+        ws_path="/ws"
     elif [ "$path_input" = "0" ]; then
-        GOST_WS_PATH=""
+        ws_path=""
     else
-        GOST_WS_PATH=$(ensure_leading_slash "$path_input")
+        ws_path=$(ensure_leading_slash "$path_input")
     fi
-    echo -e "${GREEN}当前路径: ${GOST_WS_PATH:-无}${NC}"
+    echo -e "${GREEN}当前路径: ${ws_path:-无}${NC}"
 
     local proto_combo="" proto_label=""
     local combo_user="" combo_pass="" ss_method="" ss_pass="" ss_name=""
@@ -453,9 +557,11 @@ configure_websocket() {
     if [ -n "$proto_combo" ]; then
         listen_addr="${proto_combo}://"
         if [[ "$proto_combo" == "ss+ws" ]]; then
-            listen_addr="${listen_addr}${ss_method}:${ss_pass}@:${port}"
+            listen_addr="${listen_addr}${ss_method}:$(urlencode "$ss_pass")@:${port}"
         else
-            [ -n "$combo_user" ] && listen_addr="${listen_addr}${combo_user}:${combo_pass}@"
+            if [ -n "$combo_user" ]; then
+                listen_addr="${listen_addr}$(urlencode "$combo_user"):$(urlencode "$combo_pass")@"
+            fi
             listen_addr="${listen_addr}:${port}"
         fi
     else
@@ -463,34 +569,38 @@ configure_websocket() {
     fi
 
     local params=()
-    [ -n "$GOST_WS_PATH" ] && params+=("path=${GOST_WS_PATH}")
-    local query=$(build_query_string "${params[@]}")
-    local dns_query=$(gost_dns_arg "$dns_input")
-    local final_query=$(merge_queries "$query" "$dns_query")
+    [ -n "$ws_path" ] && params+=("path=${ws_path}")
+    local query
+    query=$(build_query_string "${params[@]}")
+    local dns_query
+    dns_query=$(gost_dns_arg "$dns_input")
+    local final_query
+    final_query=$(merge_queries "$query" "$dns_query")
 
-    local cmd="$GOST_BIN -L ${listen_addr}${final_query}"
-    local ip=$(get_local_ip)
+    local ip
+    ip=$(get_local_ip)
     local info=""
     [ -n "$proto_combo" ] && info="${proto_label} over WebSocket: ${proto_combo}://${ip}:${port}" || info="WebSocket: ws://${ip}:${port}"
-    [ -n "$GOST_WS_PATH" ] && info="${info}${GOST_WS_PATH}"
+    [ -n "$ws_path" ] && info="${info}${ws_path}"
     [ -n "$dns_input" ] && info="${info} (DNS: ${dns_input})"
 
     if [[ "$proto_combo" == "ss+ws" ]]; then
         local ss_base="${ss_method}:${ss_pass}@${ip}:${port}"
         local ss_b64=""
         if command -v base64 >/dev/null 2>&1; then
-            ss_b64=$(echo -n "$ss_base" | base64 -w 0 2>/dev/null || echo -n "$ss_base" | base64)
+            ss_b64=$(printf '%s' "$ss_base" | base64 -w 0 2>/dev/null || printf '%s' "$ss_base" | base64)
         elif command -v openssl >/dev/null 2>&1; then
-            ss_b64=$(echo -n "$ss_base" | openssl base64 -A 2>/dev/null)
+            ss_b64=$(printf '%s' "$ss_base" | openssl base64 -A 2>/dev/null)
         fi
         if [ -n "$ss_b64" ]; then
             local ss_link="ss://${ss_b64}"
             [ -n "$ss_name" ] && ss_link="${ss_link}#${ss_name}"
-            info="${info}\nBase64: ${ss_link}"
+            info="${info}"$'\n'"Base64: ${ss_link}"
+            info="${info}"$'\n'"注意: 客户端需支持 Shadowsocks over WebSocket，并手动配置 path=${ws_path:-/}"
         fi
     fi
 
-    start_gost_generic "$cmd" "$info"
+    start_gost "$info" "$GOST_BIN" -L "${listen_addr}${final_query}"
 }
 
 # ---------- 链式代理 ----------
@@ -522,15 +632,6 @@ configure_chain() {
             [[ "$local_user" =~ [:@/] || "$local_pass" =~ [:@/] ]] && echo -e "${RED}含特殊字符，重输${NC}" || break
         done
         flush_input
-    fi
-
-    local local_listen=""
-    if [ -n "$local_user" ]; then
-        local_listen="-L ${local_proto}://${local_user}:${local_pass}@:${local_port}"
-        local_listen_arg="${local_user}:${local_pass}@:${local_port}"
-    else
-        local_listen="-L ${local_proto}://:${local_port}"
-        local_listen_arg=":${local_port}"
     fi
 
     local remote_proto="ws" remote_user="" remote_pass="" remote_ss_method="" remote_ss_pass=""
@@ -608,62 +709,79 @@ configure_chain() {
         ws|wss) remote_url="${remote_proto}://${remote_host}:${remote_port}" ;;
         http+ws|http+wss|socks5+ws|socks5+wss)
             remote_url="${remote_proto}://"
-            [ -n "$remote_user" ] && remote_url="${remote_url}${remote_user}:${remote_pass}@"
+            if [ -n "$remote_user" ]; then
+                remote_url="${remote_url}$(urlencode "$remote_user"):$(urlencode "$remote_pass")@"
+            fi
             remote_url="${remote_url}${remote_host}:${remote_port}"
             ;;
         ss+ws|ss+wss)
-            remote_url="${remote_proto}://${remote_ss_method}:${remote_ss_pass}@${remote_host}:${remote_port}"
+            remote_url="${remote_proto}://${remote_ss_method}:$(urlencode "$remote_ss_pass")@${remote_host}:${remote_port}"
             ;;
     esac
     local params=(); [ -n "$remote_path" ] && params+=("path=${remote_path}")
-    local query=$(build_query_string "${params[@]}")
-    local dns_query=$(gost_dns_arg "$dns_input")
-    local final_query=$(merge_queries "$query" "$dns_query")
+    local query
+    query=$(build_query_string "${params[@]}")
+    local dns_query
+    dns_query=$(gost_dns_arg "$dns_input")
+    local final_query
+    final_query=$(merge_queries "$query" "$dns_query")
     remote_url="${remote_url}${final_query}"
 
-    local cmd="$GOST_BIN $local_listen -F $remote_url"
+    local cmd=("$GOST_BIN")
+    local local_listen_arg
+    if [ -n "$local_user" ]; then
+        cmd+=(-L "${local_proto}://$(urlencode "$local_user"):$(urlencode "$local_pass")@:${local_port}")
+        local_listen_arg="${local_user}:${local_pass}@:${local_port}"
+    else
+        cmd+=(-L "${local_proto}://:${local_port}")
+        local_listen_arg=":${local_port}"
+    fi
+    cmd+=(-F "$remote_url")
+
     local info="链式代理: ${local_proto}://${local_listen_arg} -> ${remote_url}"
-    start_gost_generic "$cmd" "$info"
+    start_gost "$info" "${cmd[@]}"
 }
 
 start_gost_legacy() {
     local protocol=$1 port=$2 auth1=$3 auth2=$4 name=$5 dns_input=$6
-    cd "$GOST_DIR" || return 1
-    stop_gost
-
-    local dns_query=$(gost_dns_arg "$dns_input")
-    local final_query=$(merge_queries "" "$dns_query")
-    local cmd="" proxy_url="" ip=$(get_local_ip)
+    local dns_query
+    dns_query=$(gost_dns_arg "$dns_input")
+    local final_query
+    final_query=$(merge_queries "" "$dns_query")
+    local ip
+    ip=$(get_local_ip)
+    local proxy_url=""
+    local extra=""
+    local cmd=("$GOST_BIN")
 
     case $protocol in
         1) if [ -n "$auth1" ]; then
-               cmd="$GOST_BIN -L http://${auth1}:${auth2}@:${port}${final_query}"
+               cmd+=(-L "http://$(urlencode "$auth1"):$(urlencode "$auth2")@:${port}${final_query}")
                proxy_url="http://${auth1}:${auth2}@${ip}:${port}"
            else
-               cmd="$GOST_BIN -L http://:${port}${final_query}"
+               cmd+=(-L "http://:${port}${final_query}")
                proxy_url="http://${ip}:${port}"
            fi ;;
         2) if [ -n "$auth1" ]; then
-               cmd="$GOST_BIN -L socks5://${auth1}:${auth2}@:${port}${final_query}"
+               cmd+=(-L "socks5://$(urlencode "$auth1"):$(urlencode "$auth2")@:${port}${final_query}")
                proxy_url="socks5://${auth1}:${auth2}@${ip}:${port}"
            else
-               cmd="$GOST_BIN -L socks5://:${port}${final_query}"
+               cmd+=(-L "socks5://:${port}${final_query}")
                proxy_url="socks5://${ip}:${port}"
            fi ;;
         3) if [ -n "$auth1" ]; then
-               cmd="$GOST_BIN -L ${auth1}:${auth2}@:${port}${final_query}"
+               cmd+=(-L "$(urlencode "$auth1"):$(urlencode "$auth2")@:${port}${final_query}")
                proxy_url="http://${auth1}:${auth2}@${ip}:${port} / socks5://${auth1}:${auth2}@${ip}:${port}"
            else
-               cmd="$GOST_BIN -L :${port}${final_query}"
+               cmd+=(-L ":${port}${final_query}")
                proxy_url="http://${ip}:${port} / socks5://${ip}:${port}"
            fi ;;
-        4) cmd="$GOST_BIN -L ss://${auth1}:${auth2}@:${port}${final_query}"
+        4) cmd+=(-L "ss://${auth1}:$(urlencode "$auth2")@:${port}${final_query}")
            local ss_link="${auth1}:${auth2}@${ip}:${port}"
-           local extra=""
            if command -v base64 >/dev/null 2>&1; then
-               extra=$(echo -n "$ss_link" | base64 -w 0 2>/dev/null || echo -n "$ss_link" | base64)
+               extra=$(printf '%s' "$ss_link" | base64 -w 0 2>/dev/null || printf '%s' "$ss_link" | base64)
            elif command -v openssl >/dev/null 2>&1; then
-               extra=$(echo -n "$ss_link" | openssl base64 -A 2>/dev/null)
+               extra=$(printf '%s' "$ss_link" | openssl base64 -A 2>/dev/null)
            fi
            proxy_url="ss://${auth1}:${auth2}@${ip}:${port}"
            [ -n "$name" ] && proxy_url="${proxy_url}#${name}"
@@ -675,38 +793,11 @@ start_gost_legacy() {
     esac
     [ -n "$dns_input" ] && proxy_url="${proxy_url} (DNS: ${dns_input})"
 
-    echo "$cmd" > "$GOST_CMD_FILE"
-    echo "=== GOST 启动于 $(date) ===" > "$GOST_LOG"
-    echo "命令: $cmd" >> "$GOST_LOG"
-    echo "信息: $proxy_url" >> "$GOST_LOG"
-    nohup $cmd >> "$GOST_LOG" 2>&1 &
-    local pid=$!
-    echo $pid > "$GOST_PID_FILE"
-    sleep 2
-    if pgrep -f "$GOST_BIN" >/dev/null 2>&1; then
-        echo -e "${GREEN}✓ 运行中 (PID: $pid)${NC}"
-        echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-        echo -e "${GREEN}代理链接:${NC}\n${YELLOW}${proxy_url}${NC}"
-        if [ "$protocol" -eq 4 ]; then
-            if [ -n "$extra" ]; then
-                echo -e "${GREEN}Base64:${NC}\n${YELLOW}${extra}${NC}"
-                save_node_info "${proxy_url}"$'\n'"Base64: ${extra}"
-            else
-                echo -e "${YELLOW}Base64 编码不可用，已保存普通链接${NC}"
-                save_node_info "$proxy_url"
-            fi
-        else
-            save_node_info "$proxy_url"
-        fi
-        echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-        echo "PID: $pid 启动成功" >> "$GOST_LOG"
-        return 0
-    else
-        echo -e "${RED}启动失败，最后几行日志:${NC}"
-        tail -5 "$GOST_LOG"
-        echo -e "${RED}查看完整日志: ${GOST_LOG}${NC}"
-        return 1
+    local info="$proxy_url"
+    if [ "$protocol" -eq 4 ] && [ -n "$extra" ]; then
+        info="${info}"$'\n'"Base64: ${extra}"
     fi
+    start_gost "$info" "${cmd[@]}"
 }
 
 custom_command() {
@@ -715,7 +806,8 @@ custom_command() {
         flush_input; read -n 1 -p "按任意键返回..."; return 1
     fi
 
-    local ver=$(get_installed_gost_version)
+    local ver
+    ver=$(get_installed_gost_version)
     echo -e "${GREEN}当前 GOST 版本: ${ver}${NC}"
     echo -n -e "${YELLOW}你是否熟悉 GOST $(is_v3 && echo 'v3' || echo 'v2') 的命令语法？[y/N]: ${NC}"
     read familiar; flush_input
@@ -737,7 +829,13 @@ custom_command() {
         custom_cmd="${GOST_BIN}${custom_cmd#gost}"
     fi
 
-    start_gost_generic "$custom_cmd" "自定义命令"
+    local cmd_arr=()
+    eval "cmd_arr=($custom_cmd)"
+    if [ ${#cmd_arr[@]} -eq 0 ]; then
+        echo -e "${RED}命令解析失败${NC}"; flush_input; read -n 1 -p "按任意键返回..."; return 1
+    fi
+
+    start_gost "自定义命令" "${cmd_arr[@]}"
 }
 
 configure_proxy() {
@@ -754,7 +852,8 @@ configure_proxy() {
     fi
 
     if [ "$skip_confirm" != "auto" ]; then
-        local ver=$(get_installed_gost_version)
+        local ver
+        ver=$(get_installed_gost_version)
         echo -e "${GREEN}当前版本: ${ver}${NC}"
         if pgrep -f "$GOST_BIN" >/dev/null 2>&1; then
             echo -e "${YELLOW}运行中 PID: $(pgrep -f "$GOST_BIN" | head -1)，重新配置将停止旧进程。${NC}"
@@ -803,7 +902,8 @@ configure_proxy() {
                 fi
             else
                 echo -e "${BLUE}Shadowsocks 配置${NC}"
-                local gost_ver=$(get_installed_gost_version)
+                local gost_ver
+                gost_ver=$(get_installed_gost_version)
                 local ss_methods=() ss_names=()
                 if version_ge "$gost_ver" "2.8.0"; then
                     ss_methods=("aes-256-gcm" "aes-128-gcm" "chacha20-ietf-poly1305")
@@ -812,9 +912,14 @@ configure_proxy() {
                 else
                     echo -e "${RED}版本低于 2.8，不支持 SS，请升级。${NC}"; flush_input; read -n 1 -p "按任意键返回..."; return 1
                 fi
+                local i
                 for i in "${!ss_names[@]}"; do echo "  $((i+1))) ${ss_names[$i]}"; done
                 echo -n -e "${YELLOW}加密方式 (默认 1): ${NC}"; read mch; flush_input; [ -z "$mch" ] && mch=1
-                [[ "$mch" -ge 1 && "$mch" -le 3 ]] && method="${ss_methods[$((mch-1))]}" || method="aes-256-gcm"
+                if [[ "$mch" -ge 1 && "$mch" -le 3 ]]; then
+                    method="${ss_methods[$((mch-1))]}"
+                else
+                    method="aes-256-gcm"
+                fi
                 while true; do
                     echo -n -e "${YELLOW}密码 (默认 123456): ${NC}"; read password; flush_input
                     [ -z "$password" ] && password="123456"
@@ -850,29 +955,32 @@ configure_proxy() {
 }
 
 enable_autostart() {
-    local cron_now=$(crontab -l 2>/dev/null | grep -v "$GOST_DIR")
+    local cron_now
+    cron_now=$(crontab -l 2>/dev/null | grep -vF "$GOST_DIR")
     cat > "$GOST_DIR/keepalive.sh" << EOF
 #!/usr/bin/env bash
 GOST_DIR="$GOST_DIR"
-cd "\$GOST_DIR"
-if [ -f gost.pid ] && kill -0 \$(cat gost.pid) 2>/dev/null; then exit 0; fi
-if ! pgrep -f "\$GOST_DIR/gost" >/dev/null; then
+cd "\$GOST_DIR" 2>/dev/null || exit 0
+if [ -f gost.pid ] && kill -0 "\$(cat gost.pid)" 2>/dev/null; then exit 0; fi
+if ! pgrep -f "\$GOST_DIR/gost" >/dev/null 2>&1; then
     if [ -f start_cmd.txt ]; then
-        cmd=\$(cat start_cmd.txt)
-        nohup \$cmd >> gost.log 2>&1 &
+        cmd_str=\$(cat start_cmd.txt)
+        eval "nohup \$cmd_str >> \"\$GOST_DIR/gost.log\" 2>&1 &"
         echo \$! > gost.pid
     fi
 fi
 EOF
-    chmod +x "$GOST_DIR/keepalive.sh"
-    (echo "$cron_now"; echo "@reboot $GOST_DIR/keepalive.sh"; echo "*/5 * * * * $GOST_DIR/keepalive.sh") | crontab -
+    chmod 700 "$GOST_DIR/keepalive.sh"
+    (printf '%s\n' "$cron_now"; \
+     printf '@reboot "%s"\n' "$GOST_DIR/keepalive.sh"; \
+     printf '*/5 * * * * "%s"\n' "$GOST_DIR/keepalive.sh") | crontab -
     echo -e "${GREEN}✓ 已配置自启和保活${NC}"
 }
 
 uninstall_gost() {
     echo -e "${YELLOW}卸载 GOST...${NC}"
     stop_gost
-    crontab -l 2>/dev/null | grep -v "$GOST_DIR" | crontab -
+    crontab -l 2>/dev/null | grep -vF "$GOST_DIR" | crontab -
     rm -rf "$GOST_DIR"
     echo -e "${GREEN}✓ 卸载完成${NC}"
 }
@@ -923,26 +1031,37 @@ view_log() {
 
 update_script() {
     local url="https://raw.githubusercontent.com/goyo123321a/gost-manager/refs/heads/main/gost-manager.sh"
-    local tmp="/tmp/gost-manager-update.sh"
+    local tmp
+    tmp=$(mktemp 2>/dev/null) || { echo -e "${RED}无法创建临时文件${NC}"; flush_input; read -n 1 -p "按任意键返回..."; return 1; }
     echo -e "${YELLOW}下载最新脚本...${NC}"
-    if wget -q --timeout=30 -O "$tmp" "$url" 2>/dev/null || curl -fsSL --connect-timeout 30 "$url" -o "$tmp" 2>/dev/null; then
-        if [ -s "$tmp" ]; then
-            cp "$tmp" "$0" && chmod +x "$0" && rm -f "$tmp"
-            echo -e "${GREEN}✓ 更新成功！${NC}"
-            echo -e "${YELLOW}请重新运行脚本，快速命令: ${GREEN}~/gost-manager.sh${NC} 或 ${GREEN}bash ~/gost-manager.sh${NC}"
-            flush_input; read -n 1 -p "按任意键退出..."
-            exit 0
-        else
-            echo -e "${RED}下载的文件为空，更新失败。${NC}"
-        fi
-    else
+    if ! { wget -q --timeout=30 -O "$tmp" "$url" 2>/dev/null || curl -fsSL --connect-timeout 30 "$url" -o "$tmp" 2>/dev/null; }; then
+        rm -f "$tmp"
         echo -e "${RED}自动下载失败，可能是网络问题。${NC}"
+        echo -e "${YELLOW}请手动执行以下命令更新脚本：${NC}"
+        echo -e "${GREEN}curl -fsSL ${url} -o ~/gost-manager.sh && chmod +x ~/gost-manager.sh${NC}"
+        echo -e "${YELLOW}然后重新运行 ${GREEN}~/gost-manager.sh${NC}"
+        flush_input; read -n 1 -p "按任意键退出..."
+        exit 1
     fi
-    echo -e "${YELLOW}请手动执行以下命令更新脚本：${NC}"
-    echo -e "${GREEN}curl -fsSL ${url} -o ~/gost-manager.sh && chmod +x ~/gost-manager.sh${NC}"
-    echo -e "${YELLOW}然后重新运行 ${GREEN}~/gost-manager.sh${NC}"
+    if [ ! -s "$tmp" ] || ! head -1 "$tmp" | grep -q '^#!/usr/bin/env bash' || ! grep -q 'show_menu' "$tmp"; then
+        rm -f "$tmp"
+        echo -e "${RED}下载内容异常（非预期脚本），已放弃更新。${NC}"
+        flush_input; read -n 1 -p "按任意键返回..."
+        return 1
+    fi
+    if [ ! -f "$0" ] || [ ! -w "$0" ]; then
+        rm -f "$tmp"
+        echo -e "${RED}当前脚本路径不可写：$0${NC}"
+        echo -e "${YELLOW}请手动执行以下命令更新脚本：${NC}"
+        echo -e "${GREEN}curl -fsSL ${url} -o ~/gost-manager.sh && chmod +x ~/gost-manager.sh${NC}"
+        flush_input; read -n 1 -p "按任意键退出..."
+        exit 1
+    fi
+    cat "$tmp" > "$0" && chmod +x "$0" && rm -f "$tmp"
+    echo -e "${GREEN}✓ 更新成功！${NC}"
+    echo -e "${YELLOW}请重新运行脚本，快速命令: ${GREEN}~/gost-manager.sh${NC} 或 ${GREEN}bash ~/gost-manager.sh${NC}"
     flush_input; read -n 1 -p "按任意键退出..."
-    exit 1
+    exit 0
 }
 
 show_menu() {
